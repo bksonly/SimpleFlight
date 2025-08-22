@@ -21,6 +21,7 @@ from ..utils.pointed_star import NPointedStar
 from ..utils.lemniscate import Lemniscate
 import collections
 import numpy as np
+import zmq
 
 class Track(IsaacEnv):
     def __init__(self, cfg, headless):
@@ -57,6 +58,14 @@ class Track(IsaacEnv):
         self.sim_data = []
         self.sim_rpy = []
         self.action_data = []
+
+        self.diffusion_server_address = "tcp://localhost:5555"
+        self.zmq_context = zmq.Context()
+        self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+        self.zmq_socket.connect(self.diffusion_server_address)
+
+        self.diffusion = cfg.task.diffusion
+        self.diffusion_update_freq = cfg.task.diffusion_update_freq
 
         super().__init__(cfg, headless)
 
@@ -202,6 +211,9 @@ class Track(IsaacEnv):
         # action history
         self.action_history = self.cfg.task.action_history_step if self.cfg.task.use_action_history else 0
         self.action_history_buffer = collections.deque(maxlen=self.action_history)
+
+        if self.diffusion:
+            self.diffusion_buffer = collections.deque(maxlen=self.diffusion_update_freq)
 
         if self.time_encoding:
             state_dim = obs_dim
@@ -365,6 +377,32 @@ class Track(IsaacEnv):
             wind_forces = wind_forces.unsqueeze(1).expand(*self.drone.shape, 3)
             self.drone.base_link.apply_forces(wind_forces, is_global=True)
 
+        if self.diffusion:
+            if not self.diffusion_buffer:
+                diffusion_obs = self.drone.get_diffusion_obs()
+                H_all = self._call_diffusion_api(diffusion_obs)
+                for i in range(self.diffusion_update_freq):
+                    self.diffusion_buffer.append(H_all[:,i,:])
+            H_now = self.diffusion_buffer.popleft()        
+            self.drone.base_link.apply_forces(H_now[:,:3] * 0.1, is_global=True)
+            # self.drone.base_link.apply_forces_and_torques_at_pos(
+            #     torques=H_now[:,3:],
+            #     is_global=False
+            # )
+
+    def _call_diffusion_api(self, obs_tensor: torch.Tensor) -> torch.Tensor:
+        try:
+            obs_bytes = obs_tensor.cpu().numpy().tobytes()
+            self.zmq_socket.send(obs_bytes)
+            reply_bytes = self.zmq_socket.recv()
+            H_shape = (obs_tensor.shape[0], 16, 6) # e.g., (8192, 16, 6)
+            reply_array = np.frombuffer(reply_bytes, dtype=np.float32).reshape(H_shape).copy()
+            H = torch.from_numpy(reply_array).to(self.device)
+            return H
+            
+        except Exception as e:
+            print(f"ZMQ diffusion 故障: {e}")
+            return torch.zeros((obs_tensor.shape[0], 16, 6), device=self.device)        
     def _compute_state_and_obs(self):
         self.root_state = self.drone.get_state()
         self.info["drone_state"][:] = self.root_state[..., :13]

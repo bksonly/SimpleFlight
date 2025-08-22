@@ -38,7 +38,7 @@ from omni_drones.controllers import LeePositionController
 
 from omni_drones.robots import RobotBase, RobotCfg
 from omni_drones.utils.torch import (
-    normalize, off_diag, quat_rotate, quat_rotate_inverse, quat_axis, symlog
+    normalize, off_diag, quat_rotate, quat_rotate_inverse, quat_axis, symlog,quaternion_to_euler
 )
 
 from dataclasses import dataclass
@@ -532,11 +532,12 @@ class MultirotorBase(RobotBase):
             quat_rotate_inverse(self.rot, vel_w[..., :3]),
             quat_rotate_inverse(self.rot, vel_w[..., 3:])
         ], dim=-1)
+        acc = self.acc.lerp((vel_w - self.vel_w) / self.dt, self.alpha)
+        self.acc[:] = acc
         self.vel_w[:] = vel_w
         self.vel_b[:] = vel_b
         
-        # acc = self.acc.lerp((vel - self.vel) / self.dt, self.alpha)
-        # self.acc[:] = acc
+
         self.heading[:] = quat_axis(self.rot, axis=0)
         self.lateral[:] = quat_axis(self.rot, axis=1)
         self.up[:] = quat_axis(self.rot, axis=2)
@@ -560,6 +561,25 @@ class MultirotorBase(RobotBase):
             assert not torch.isnan(state).any()
         return state
 
+    def get_diffusion_obs(self):
+        rpy = quaternion_to_euler(self.rot)
+        collective_thrust = self.thrusts[..., 2].sum(-1, keepdim=True)
+        d = 32.2/1000.0
+        T2M = 0.005964552
+        #坐标系z轴朝上
+        [f1, f2, f3, f4] = self.thrusts[..., 2].unbind(-1)
+        Mx = (f1 + f2 - f3 - f4) * d
+        My = (-f1 + f2 + f3 - f4) * d
+        Mz = (f1 - f2 + f3 - f4) * T2M      
+
+        diffusion_obs = torch.cat([
+            self.pos,  self.vel_w[..., :3], self.acc[..., :3],
+            rpy, self.vel_b[..., 3:],
+            collective_thrust, Mx.unsqueeze(-1), My.unsqueeze(-1), Mz.unsqueeze(-1)
+        ], dim=-1)
+
+        return diffusion_obs.squeeze(1)
+    
     def _reset_idx(self, env_ids: torch.Tensor, train: bool=True):
         if env_ids is None:
             env_ids = torch.arange(self.shape[0], device=self.device)

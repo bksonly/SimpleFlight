@@ -274,7 +274,7 @@ def main(cfg):
         
         return info
 
-    pbar = tqdm(collector)
+    pbar = tqdm(collector, total=total_frames // frames_per_batch)
     env.train()
     fps = []
     for i, data in enumerate(pbar):
