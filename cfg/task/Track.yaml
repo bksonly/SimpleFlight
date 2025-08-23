@@ -16,7 +16,7 @@ wind: false
 latency: false
 latency_step: 1
 random_latency: true
-diffusion: true 
+diffusion: false 
 
 reset_thres: 1.
 future_traj_steps: 10

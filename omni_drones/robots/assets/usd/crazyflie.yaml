@@ -6,14 +6,22 @@ target_clip: 1.0
 min_thrust_ratio: 0.0
 max_thrust_ratio: 0.9
 fixed_yaw: 0
+# inertia:
+#   xx: 1.4e-5
+#   xy: 0.0
+#   xz: 0.0
+#   yy: 1.4e-5
+#   yz: 0.0
+#   zz: 2.17e-5
+# mass: 0.0321 # origin 0.0321
 inertia:
-  xx: 1.4e-5
+  xx: 2.388e-5
   xy: 0.0
   xz: 0.0
-  yy: 1.4e-5
+  yy: 2.392e-5
   yz: 0.0
-  zz: 2.17e-5
-mass: 0.0321 # origin 0.0321
+  zz: 4.409e-5
+mass: 0.0336 
 l: 0.096
 drag_coef: 0.0
 rotor_configuration:
