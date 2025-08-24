@@ -52,20 +52,35 @@ class RotorGroup(nn.Module):
 
         self.requires_grad_(False)
 
-    def forward(self, cmds: torch.Tensor):
-        target_throttle = self.f_inv(torch.clamp((cmds + 1) / 2, 0., 1.))
+    # def forward(self, cmds: torch.Tensor):
+    #     target_throttle = self.f_inv(torch.clamp((cmds + 1) / 2, 0., 1.))
 
+    #     tau = torch.where(target_throttle > self.throttle, self.tau_up, self.tau_down)
+    #     tau = torch.clamp(tau, 0, 1)
+    #     # jiayu: replace tau by dt / time_constant
+    #     tau = self.dt / tau
+    #     # throttle(t + dt) = throttle(t) * (1 - tau) + target_throttle * tau
+        
+    #     self.throttle.add_(tau * (target_throttle - self.throttle))
+
+    #     self.noise = torch.randn_like(self.throttle) * self.noise_scale
+    #     t = torch.clamp(self.f(self.throttle) + self.noise, 0., 1.)
+    #     thrusts = t * self.KF
+    #     moments = (t * self.KM) * -self.directions
+
+    #     return thrusts, moments
+
+    def forward(self, cmds: torch.Tensor):
+        target_throttle = torch.clamp((cmds + 1) / 2, 0., 1.)
         tau = torch.where(target_throttle > self.throttle, self.tau_up, self.tau_down)
         tau = torch.clamp(tau, 0, 1)
-        # jiayu: replace tau by dt / time_constant
         tau = self.dt / tau
         # throttle(t + dt) = throttle(t) * (1 - tau) + target_throttle * tau
         
         self.throttle.add_(tau * (target_throttle - self.throttle))
 
         self.noise = torch.randn_like(self.throttle) * self.noise_scale
-        t = torch.clamp(self.f(self.throttle) + self.noise, 0., 1.)
-        thrusts = t * self.KF
-        moments = (t * self.KM) * -self.directions
+        thrusts = torch.clamp(0.0656 * torch.square(self.throttle) + 0.088 * self.throttle - 0.0002424 + self.noise, 0., 1.)
+        moments = (thrusts * 0.005964552) * -self.directions
 
         return thrusts, moments

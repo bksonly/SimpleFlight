@@ -24,7 +24,7 @@ viewer:
 
 wandb:
   group: ${oc.select:..task.name}
-  run_name: mass_inertia
+  run_name: sigma2thrust
   # run_name: debug
   job_type: train
   entity: zy_z
