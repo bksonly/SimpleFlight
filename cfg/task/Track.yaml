@@ -32,6 +32,7 @@ diffusion_update_freq: 15
 
 # add pos to obs
 use_ab_wolrd_pos: false
+use_rpy_obs: true
 # up
 reward_up_weight: 1.0
 # spin

@@ -22,6 +22,8 @@ from ..utils.lemniscate import Lemniscate
 import collections
 import numpy as np
 import zmq
+from omni_drones.utils.torch import quaternion_to_euler
+
 
 class Track(IsaacEnv):
     def __init__(self, cfg, headless):
@@ -54,6 +56,7 @@ class Track(IsaacEnv):
         self.reward_spin_weight = cfg.task.reward_spin_weight
         self.reward_up_weight = cfg.task.reward_up_weight
         self.use_ab_wolrd_pos = cfg.task.use_ab_wolrd_pos
+        self.use_rpy_obs = cfg.task.use_rpy_obs
         self.eval_traj = cfg.task.eval_traj
         self.sim_data = []
         self.sim_rpy = []
@@ -202,7 +205,10 @@ class Track(IsaacEnv):
             drone_state_dim = 3 + 3 + 3 + 3 + 3 + 3 # pos, linear vel, body rate, heading, lateral, up
         else:
             # drone_state_dim = 4 + 3 + 3 + 3 + 3 # quat, linear vel, heading, lateral, up
-            drone_state_dim = 3 + 3 + 3 + 3 # quat, linear vel, heading, lateral, up
+            if self.use_rpy_obs:
+                drone_state_dim = 3 + 3 # linear vel, rpy
+            else: 
+                drone_state_dim = 3 + 3 + 3 + 3 # linear vel, heading, lateral, up
         obs_dim = drone_state_dim + 3 * self.future_traj_steps
         
         self.time_encoding_dim = self.cfg.task.time_encoding_dim
@@ -434,13 +440,22 @@ class Track(IsaacEnv):
                 root_state[..., 16:19], root_state[..., 19:28],
             ]
         else:
-            # rpos, linear velocity, body rate, heading, lateral, up
-            obs = [
-                self.rpos.flatten(1).unsqueeze(1),
-                # root_state[..., 3:7], # quat
-                root_state[..., 7:10], # linear v
-                root_state[..., 19:28], # rotation
-            ]
+            if self.use_rpy_obs:
+                rpy = quaternion_to_euler(root_state[..., 3:7])
+                # rpos, linear velocity, rpy
+                obs = [
+                    self.rpos.flatten(1).unsqueeze(1),
+                    root_state[..., 7:10], # linear v
+                    rpy,
+                ]
+            else:
+                # rpos, linear velocity, heading, lateral, up
+                obs = [
+                    self.rpos.flatten(1).unsqueeze(1),
+                    # root_state[..., 3:7], # quat
+                    root_state[..., 7:10], # linear v
+                    root_state[..., 19:28], # rotation
+                ]
         self.stats['drone_state'] = root_state[..., :13].squeeze(1).clone()
         if self.time_encoding:
             t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
