@@ -58,6 +58,7 @@ class Track(IsaacEnv):
         self.sim_data = []
         self.sim_rpy = []
         self.action_data = []
+        self.only_use_bodyrates_history = cfg.task.only_use_bodyrates_history
 
         self.diffusion_server_address = "tcp://localhost:5555"
         self.zmq_context = zmq.Context()
@@ -221,7 +222,10 @@ class Track(IsaacEnv):
             state_dim = obs_dim + self.time_encoding_dim
         
         if self.action_history > 0:
-            obs_dim += self.action_history * 4
+            if self.only_use_bodyrates_history:
+                obs_dim += self.action_history * 3
+            else:
+                obs_dim += self.action_history * 4
         
         self.observation_spec = CompositeSpec({
             "agents": {
@@ -492,7 +496,11 @@ class Track(IsaacEnv):
         # add action history to actor
         if self.action_history > 0:
             self.action_history_buffer.append(self.prev_actions)
-            all_action_history = torch.concat(list(self.action_history_buffer), dim=-1)
+            if self.only_use_bodyrates_history:
+                history_to_concat = [action[..., :3] for action in list(self.action_history_buffer)]
+                all_action_history = torch.concat(history_to_concat, dim=-1)
+            else:
+                all_action_history = torch.concat(list(self.action_history_buffer), dim=-1)
             obs = torch.cat([obs, all_action_history], dim=-1)
 
         if self.use_eval:
@@ -650,6 +658,8 @@ class Track(IsaacEnv):
         if env_ids is None:
             env_ids = ...
         # discrete t
+        if steps != 1:
+            step_size = 50.0 / (steps-1)
         t = self.progress_buf.unsqueeze(1) + step_size * torch.arange(steps, device=self.device)
         # t: [env_ids, steps], continuous t
         t = self.traj_t0 + t * self.dt
