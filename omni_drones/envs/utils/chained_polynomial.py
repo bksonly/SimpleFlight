@@ -131,7 +131,7 @@ class ChainedPolynomial(BaseTrajectory):
 
         batch_size, num_t = t.shape
         
-        idx_x = torch.searchsorted(self.T_x, t).squeeze(-1)
+        idx_x = torch.searchsorted(self.T_x, t)#.squeeze(-1)
         
         offset = self.T_x.gather(1, (idx_x - 1) % self.T_x.shape[1])
 
@@ -144,7 +144,7 @@ class ChainedPolynomial(BaseTrajectory):
         x = mu.poly(x_coeffs.reshape(-1, self.degree + 1), (t - offset).reshape(-1, 1),).reshape(self.num_trajs, -1, 1)
 
         if self.use_y:
-            idx_y = torch.searchsorted(self.T_y, t).squeeze(-1)
+            idx_y = torch.searchsorted(self.T_y, t)#.squeeze(-1)
             offset = self.T_y.gather(1, (idx_y - 1) % self.T_y.shape[1])
             # expand idx_y
             idx_y_expanded = idx_y.unsqueeze(1).expand(-1, self.y_coeffs.shape[1], -1)
