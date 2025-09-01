@@ -532,8 +532,11 @@ class MultirotorBase(RobotBase):
             quat_rotate_inverse(self.rot, vel_w[..., :3]),
             quat_rotate_inverse(self.rot, vel_w[..., 3:])
         ], dim=-1)
-        acc = self.acc.lerp((vel_w - self.vel_w) / self.dt, self.alpha)
+        # acc = self.acc.lerp((vel_w - self.vel_w) / self.dt, self.alpha)
+        acc = (vel_w - self.vel_w) / self.dt
+        alpha = (vel_b - self.vel_b) / self.dt
         self.acc[:] = acc
+        self.acc_b[:] = alpha
         self.vel_w[:] = vel_w
         self.vel_b[:] = vel_b
         
@@ -574,7 +577,7 @@ class MultirotorBase(RobotBase):
 
         diffusion_obs = torch.cat([
             self.pos,  self.vel_w[..., :3], self.acc[..., :3],
-            rpy, self.vel_b[..., 3:],
+            rpy, self.vel_b[..., 3:],self.acc_b[..., 3:],
             collective_thrust, Mx.unsqueeze(-1), My.unsqueeze(-1), Mz.unsqueeze(-1)
         ], dim=-1)
 

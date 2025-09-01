@@ -57,6 +57,7 @@ class Track(IsaacEnv):
         self.reward_up_weight = cfg.task.reward_up_weight
         self.use_ab_wolrd_pos = cfg.task.use_ab_wolrd_pos
         self.use_rpy_obs = cfg.task.use_rpy_obs
+        self.use_quat_obs = cfg.task.use_quat_obs
         self.eval_traj = cfg.task.eval_traj
         self.sim_data = []
         self.sim_rpy = []
@@ -207,6 +208,8 @@ class Track(IsaacEnv):
             # drone_state_dim = 4 + 3 + 3 + 3 + 3 # quat, linear vel, heading, lateral, up
             if self.use_rpy_obs:
                 drone_state_dim = 3 + 3 # linear vel, rpy
+            elif self.use_quat_obs:
+                drone_state_dim = 3 + 4
             else: 
                 drone_state_dim = 3 + 3 + 3 + 3 # linear vel, heading, lateral, up
         obs_dim = drone_state_dim + 3 * self.future_traj_steps
@@ -447,6 +450,13 @@ class Track(IsaacEnv):
                     self.rpos.flatten(1).unsqueeze(1),
                     root_state[..., 7:10], # linear v
                     rpy,
+                ]
+            elif self.use_quat_obs:
+                # rpos, linear velocity, quat
+                obs = [
+                    self.rpos.flatten(1).unsqueeze(1),
+                    root_state[..., 7:10], # linear v
+                    root_state[..., 3:7], # quat
                 ]
             else:
                 # rpos, linear velocity, heading, lateral, up
