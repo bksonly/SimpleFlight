@@ -70,6 +70,7 @@ class Track(IsaacEnv):
         self.zmq_socket.connect(self.diffusion_server_address)
 
         self.diffusion = cfg.task.diffusion
+        self.use_HM = cfg.task.use_HM
         self.diffusion_update_freq = cfg.task.diffusion_update_freq
 
         super().__init__(cfg, headless)
@@ -397,11 +398,12 @@ class Track(IsaacEnv):
                 for i in range(self.diffusion_update_freq):
                     self.diffusion_buffer.append(H_all[:,i,:])
             H_now = self.diffusion_buffer.popleft()        
-            self.drone.base_link.apply_forces(H_now[:,:3] * 0.1, is_global=True)
-            # self.drone.base_link.apply_forces_and_torques_at_pos(
-            #     torques=H_now[:,3:],
-            #     is_global=False
-            # )
+            self.drone.base_link.apply_forces(H_now[:,:3], is_global=True)
+            if self.use_HM:
+                self.drone.base_link.apply_forces_and_torques_at_pos(
+                    torques=H_now[:,3:],
+                    is_global=False
+                )
 
     def _call_diffusion_api(self, obs_tensor: torch.Tensor) -> torch.Tensor:
         try:

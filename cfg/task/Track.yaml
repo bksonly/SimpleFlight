@@ -17,6 +17,7 @@ latency: false
 latency_step: 1
 random_latency: true
 diffusion: false 
+use_HM: false
 
 reset_thres: 1.
 future_traj_steps: 10
