@@ -24,7 +24,7 @@ viewer:
 
 wandb:
   group: ${oc.select:..task.name}
-  run_name: quat
+  run_name: rotor-noise0.005
   # run_name: debug
   job_type: train
   entity: zy_z

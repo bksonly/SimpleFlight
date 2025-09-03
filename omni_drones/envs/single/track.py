@@ -398,7 +398,7 @@ class Track(IsaacEnv):
                 for i in range(self.diffusion_update_freq):
                     self.diffusion_buffer.append(H_all[:,i,:])
             H_now = self.diffusion_buffer.popleft()        
-            self.drone.base_link.apply_forces(H_now[:,:3], is_global=True)
+            self.drone.base_link.apply_forces(H_now[:,:3]*0.1, is_global=True)
             if self.use_HM:
                 self.drone.base_link.apply_forces_and_torques_at_pos(
                     torques=H_now[:,3:],
