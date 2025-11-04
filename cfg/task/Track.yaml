@@ -28,8 +28,9 @@ eval_traj: 'normal' # poly, zigzag, pentagram, slow, normal, fast
 use_rotor2critic: 0 # need to set critic_input = 'state'
 use_action_history: false
 only_use_bodyrates_history: false
+only_use_thrust_history: false
 action_history_step: 1
-diffusion_update_freq: 5
+diffusion_update_freq: 3
 
 # add pos to obs
 use_ab_wolrd_pos: false

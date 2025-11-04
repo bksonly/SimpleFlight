@@ -63,6 +63,7 @@ class Track(IsaacEnv):
         self.sim_rpy = []
         self.action_data = []
         self.only_use_bodyrates_history = cfg.task.only_use_bodyrates_history
+        self.only_use_thrust_history = cfg.task.only_use_thrust_history
 
         self.diffusion_server_address = "tcp://localhost:5555"
         self.zmq_context = zmq.Context()
@@ -234,6 +235,8 @@ class Track(IsaacEnv):
         if self.action_history > 0:
             if self.only_use_bodyrates_history:
                 obs_dim += self.action_history * 3
+            elif self.only_use_thrust_history:
+                obs_dim += self.action_history * 1
             else:
                 obs_dim += self.action_history * 4
         
@@ -397,11 +400,15 @@ class Track(IsaacEnv):
                 H_all = self._call_diffusion_api(diffusion_obs)
                 for i in range(self.diffusion_update_freq):
                     self.diffusion_buffer.append(H_all[:,i,:])
-            H_now = self.diffusion_buffer.popleft()        
-            self.drone.base_link.apply_forces(H_now[:,:3]*0.1, is_global=True)
+            H_now = self.diffusion_buffer.popleft() 
+            
+            H_part = torch.zeros_like(H_now)  
+            H_part[0:100, :] = H_now[0:100, :]     
+
+            self.drone.base_link.apply_forces(H_part[:,:3], is_global=True)
             if self.use_HM:
                 self.drone.base_link.apply_forces_and_torques_at_pos(
-                    torques=H_now[:,3:],
+                    torques=H_part[:,3:],
                     is_global=False
                 )
 
@@ -525,6 +532,9 @@ class Track(IsaacEnv):
             self.action_history_buffer.append(self.prev_actions)
             if self.only_use_bodyrates_history:
                 history_to_concat = [action[..., :3] for action in list(self.action_history_buffer)]
+                all_action_history = torch.concat(history_to_concat, dim=-1)
+            elif self.only_use_thrust_history:
+                history_to_concat = [action[..., 3:] for action in list(self.action_history_buffer)]
                 all_action_history = torch.concat(history_to_concat, dim=-1)
             else:
                 all_action_history = torch.concat(list(self.action_history_buffer), dim=-1)
