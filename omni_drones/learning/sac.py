@@ -60,15 +60,9 @@ class SACPolicy(object):
         self.buffer_size = int(cfg.buffer_size)
         self.batch_size = int(cfg.batch_size)
 
-        # self.obs_name = f"{self.agent_spec.name}.obs"
-        # self.act_name = ("action", f"{self.agent_spec.name}.action")
-        # if agent_spec.state_spec is not None:
-        #     self.state_name = f"{self.agent_spec.name}.state"
-        # else:
-        #     self.state_name = f"{self.agent_spec.name}.obs"
-        # self.reward_name = f"{self.agent_spec.name}.reward"
         self.obs_name = ("agents", "observation")
         self.act_name = ("agents", "action")
+        self.state_name = ("agents", "state")
         self.reward_name = ("agents", "reward")
 
         self.make_actor()
@@ -82,7 +76,7 @@ class SACPolicy(object):
 
         self.replay_buffer = TensorDictReplayBuffer(
             batch_size=self.batch_size,
-            storage=LazyTensorStorage(max_size=self.buffer_size, device=self.device),
+            storage=LazyTensorStorage(max_size=self.buffer_size, device='cpu'),
             sampler=RandomSampler(),
         )
     
@@ -132,7 +126,7 @@ class SACPolicy(object):
         self.critic_loss_fn = {"mse": F.mse_loss, "smooth_l1": F.smooth_l1_loss}[self.cfg.critic_loss]
 
     def __call__(self, tensordict: TensorDict, deterministic: bool=False) -> TensorDict:
-        return tensordict.update({self.act_name: self.agent_spec.action_spec.zero()})
+        # return tensordict.update({self.act_name: self.agent_spec.action_spec.zero()})
         actor_input = tensordict.select(*self.policy_in_keys)
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
         actor_output = self.actor(actor_input)
@@ -141,9 +135,9 @@ class SACPolicy(object):
         return tensordict
 
     def train_op(self, data: TensorDict, verbose: bool=False):
-        self.replay_buffer.extend(data.reshape(-1))
+        self.replay_buffer.extend(data.reshape(-1).to('cpu'))
 
-        if len(self.replay_buffer) < self.cfg.buffer_size:
+        if len(self.replay_buffer) < 20000:
             print(f"filling buffer: {len(self.replay_buffer)} < {self.cfg.buffer_size}")
             return {}
         
@@ -155,11 +149,11 @@ class SACPolicy(object):
         for gradient_step in tqdm(t) if verbose else t:
 
             transition = self.replay_buffer.sample()
-
+            transition = transition.to(self.device)
             state   = transition[self.state_name]
             actions = transition[self.act_name]
 
-            reward  = transition[("next", "reward", f"{self.agent_spec.name}.reward")]
+            reward  = transition[("next", *self.reward_name)]
             next_dones  = transition[("next", "done")].float().unsqueeze(-1)
             next_state  = transition[("next", self.state_name)]
 
