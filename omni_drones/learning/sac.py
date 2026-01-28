@@ -45,6 +45,38 @@ from omni_drones.utils.torchrl import AgentSpec
 from tensordict import TensorDict
 from .common import soft_update
 
+class PIDCTBR(nn.Module):
+    """
+    传统控制器基座（PID/CTBR 等）的**接口壳**：占据与 RL actor 相同的“生态位”。
+
+    约定：
+    - 输入：obs 张量（与 RL actor 输入一致，即 `("agents","observation")`）
+    - 输出：action 张量（与 RL actor 输出一致，即写入 `("agents","action")` 的那个 action，
+      也就是 env transforms 之前的高层动作；shape/归一化/单位都要对齐）
+
+    这里先提供架构/接口，具体控制律留给师弟实现。
+    """
+
+    def __init__(self, action_dim: int):
+        super().__init__()
+        self.action_dim = int(action_dim)
+
+        # TODO(you/teammate): 直接在代码里写死参数（不要 YAML）。
+        # self.kp = ...
+        # self.ki = ...
+        # self.kd = ...
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            obs: (..., obs_dim)
+        Returns:
+            base_action: (..., action_dim)
+        """
+        # TODO(teammate): 在这里实现 pid_ctbr 控制律，输出需与 actor action 完全对齐。
+        return torch.zeros((*obs.shape[:-1], self.action_dim), device=obs.device, dtype=obs.dtype)
+
+
 class SACPolicy(object):
 
     def __init__(self,
@@ -69,6 +101,14 @@ class SACPolicy(object):
         self.make_critic()
         
         self.action_dim = self.agent_spec.action_spec.shape[-1]
+
+        # ===== Base policy wiring (for BC loss) =====
+        # base_policy 的输出会写入 ("info","base_action")，用于在 train_op 里做 bc_loss。
+        # 注意：环境仍然执行 RL actor 写入的 ("agents","action")（除非你后续改策略）。
+        self.base_policy = PIDCTBR(action_dim=self.action_dim).to(self.device)
+        # 硬编码 bc loss 系数（不要 YAML）。需要启用时改成 >0。
+        self.bc_coef = 0.0
+
         self.target_entropy = - torch.tensor(self.action_dim, device=self.device)
         init_entropy = 1.0
         self.log_alpha = nn.Parameter(torch.tensor(init_entropy, device=self.device).log())
@@ -132,6 +172,11 @@ class SACPolicy(object):
         actor_output = self.actor(actor_input)
         # actor_output["action"].batch_size = tensordict.batch_size
         tensordict.update(actor_output)
+
+        # 额外写入 base_action（不影响 env step），供 bc loss 使用
+        with torch.no_grad():
+            base_action = self.base_policy(actor_input[self.obs_name])
+        tensordict.set(("info", "base_action"), base_action)
         return tensordict
 
     def train_op(self, data: TensorDict, verbose: bool=False):
@@ -190,6 +235,14 @@ class SACPolicy(object):
                     qs = self.critic(state, act)
                     q = torch.min(qs, dim=-1).values
                     actor_loss = (self.log_alpha.exp() * logp - q).mean()
+
+                    # ===== BC loss scaffold =====
+                    # 从 rollout 时写入的 ("info","base_action") 取出基座动作，计算 bc_loss
+                    bc_loss = None
+                    if ("info", "base_action") in transition.keys(True, True):
+                        base_action = transition[("info", "base_action")]
+                        bc_loss = F.mse_loss(act, base_action) #示意，不一定是这样
+
                     self.actor_opt.zero_grad()
                     actor_loss.backward()
                     actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
@@ -206,6 +259,7 @@ class SACPolicy(object):
                         "entropy": -logp.mean(),
                         "alpha": self.log_alpha.exp().detach(),
                         "alpha_loss": alpha_loss,
+                        **({"bc_loss": bc_loss.detach()} if bc_loss is not None else {}),
                     }, []))
 
 
