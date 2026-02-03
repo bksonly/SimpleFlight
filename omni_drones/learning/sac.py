@@ -47,34 +47,197 @@ from .common import soft_update
 
 class PIDCTBR(nn.Module):
     """
-    传统控制器基座（PID/CTBR 等）的**接口壳**：占据与 RL actor 相同的“生态位”。
-
-    约定：
-    - 输入：obs 张量（与 RL actor 输入一致，即 `("agents","observation")`）
-    - 输出：action 张量（与 RL actor 输出一致，即写入 `("agents","action")` 的那个 action，
-      也就是 env transforms 之前的高层动作；shape/归一化/单位都要对齐）
-
-    这里先提供架构/接口，具体控制律留给师弟实现。
+    SimpleFlight (Isaac Sim) 环境下的 PID/CTBR 控制器。
+    复现自地面站PID。
+    
+    预期的 Observation 结构 :
+    [0:3]   : x_d - x         (世界坐标系下的位置误差)
+    [30:33] : v               (世界坐标系下的线性速度)(此处下标根据future_traj_steps的不同而定)
+    [33:42] : R               (旋转矩阵, 机体系到世界系, 展平后的 9 维向量)
+    [42:46] : a_{t-1}         (上一时刻的动作，PID 计算中暂未使用)
     """
 
     def __init__(self, action_dim: int):
         super().__init__()
         self.action_dim = int(action_dim)
 
-        # TODO(you/teammate): 直接在代码里写死参数（不要 YAML）。
-        # self.kp = ...
-        # self.ki = ...
-        # self.kd = ...
+        # === 1. 控制器参数 (根据地面站PID硬编码) ===
+        self.m = 0.032      # 无人机质量
+        self.g = 9.81       # 重力加速度
+        self.F_MAX = 0.6134 # 最大推力
+        self.T_add = 0.65   # 推力前馈比例 (悬停/偏置)
+        
+        # 增益参数
+        # Kp: [0.045, 0.045, 0.06]
+        self.register_buffer("Kp", torch.tensor([0.045, 0.045, 0.06]))
+        # Kd: [0.08, 0.08, 0.18]
+        self.register_buffer("Kd", torch.tensor([0.08, 0.08, 0.18]))
+        
+        self.tau = 0.8 # 约化姿态时间常数
+        self.theta_max = 20.0 * np.pi / 180.0 # 最大允许倾角 (弧度)
+        
+        # 幅值限制
+        self.max_tilt_force_xy = 0.06      # 水平合力限幅
+        self.max_tilt_force_z_up = 0.20    # 上升推力限幅
+        self.max_tilt_force_z_down = 0.10  # 下降推力限幅
+        self.max_thrust_cmd = 0.75         # 最大下发推力指令限幅
+        self.max_rate_deg = 50.0           # 最大角速率限制 (deg/s)
 
+        # 归一化参数 (对应 SimpleFlight Action 空间 [-1, 1])
+        # 根据 transforms.py: PIDRate 控制器会将 action * 180.0 得到物理值
+        self.norm_rate_scale = 180.0 
+        
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            obs: (..., obs_dim)
+            obs: (Batch, Agents, Obs_Dim) 或 (Batch, Obs_Dim)
         Returns:
-            base_action: (..., action_dim)
+            归一化后的 CTBR 动作: (..., 4)，范围在 [-1, 1]
+            格式: [Rate_Roll, Rate_Pitch, Rate_Yaw, Thrust]
+            (与 SimpleFlight 的 PIDRateController 期望输入对齐)
         """
-        # TODO(teammate): 在这里实现 pid_ctbr 控制律，输出需与 actor action 完全对齐。
-        return torch.zeros((*obs.shape[:-1], self.action_dim), device=obs.device, dtype=obs.dtype)
+        # 处理 Batch 维度
+        original_shape = obs.shape[:-1]
+        if obs.ndim > 2:
+            obs = obs.reshape(-1, obs.shape[-1]) # 展平 Batch 和 Agents 维度
+        
+        batch_size = obs.shape[0]
+        device = obs.device
+
+        # === 2. 解析观测值 (Observation) ===
+        # 位置误差: e_p = p_d - p
+        pos_error_scaled = obs[:, 0:3]
+        pos_error = pos_error_scaled 
+
+        
+        # 速度误差: e_v = v_d - v。假设目标速度 v_d = 0 
+        v_curr = obs[:, 30:33]
+        vel_error =  -v_curr # 目标速度为 0
+        
+        # 旋转矩阵 R (机体系 -> 世界系)
+        # 将展平的 9 维向量转回 3x3 矩阵(取转置)
+        R_flat = obs[:, 33:42]
+        R = R_flat.view(batch_size, 3, 3).transpose(1, 2)
+
+        # === 3. 位置环控制 (Position Loop) ===
+        # f = Kp * ep + Kd * ev
+        f = self.Kp * pos_error + self.Kd * vel_error 
+        
+        # 合力限幅 
+        # 水平 xy 限制在 0.06N
+        f_xy_norm = torch.norm(f[:, :2], dim=1, keepdim=True)
+        f_xy_scale = torch.clamp(self.max_tilt_force_xy / (f_xy_norm + 1e-6), max=1.0)
+        f[:, :2] = f[:, :2] * f_xy_scale
+        
+        # 垂直 z 限制 (根据地面站PID 上升 0.2N/下降 0.1N)
+        f_z = f[:, 2].clone()
+        f_z = torch.where(f_z > 0, 
+                          torch.clamp(f_z, max=self.max_tilt_force_z_up), 
+                          torch.clamp(f_z, min=-self.max_tilt_force_z_down))
+        f[:, 2] = f_z
+        
+        # 计算世界坐标系下的期望推力向量 f_W
+        # f_W = [fx, fy, T_add * FMAX + fz]
+        f_W = f.clone()
+        f_W[:, 2] += self.T_add * self.F_MAX
+        
+        # === 4. 几何映射与姿态环 (Attitude Loop) ===
+        f_W_norm = torch.norm(f_W, dim=1, keepdim=True)
+        b_raw = f_W / (f_W_norm + 1e-6)
+        
+        e3 = torch.tensor([0., 0., 1.], device=device).expand(batch_size, 3)
+        
+        # 计算当前推力方向与世界 Z 轴的夹角 theta = arccos(b_raw . e3)
+        dot_raw_e3 = torch.sum(b_raw * e3, dim=1, keepdim=True)
+        theta = torch.acos(torch.clamp(dot_raw_e3, -1.0, 1.0))
+        
+        # 计算指令姿态轴 b3_cmd (执行倾角超限投影)
+        bs_3_cmd = torch.zeros_like(b_raw)
+        
+        # 情况 1: 夹角在安全范围内
+        mask_safe = (theta <= self.theta_max).squeeze()
+        bs_3_cmd[mask_safe] = b_raw[mask_safe]
+        
+        # 情况 2: 超过最大倾角 theta_max，进行锥形投影
+        if (~mask_safe).any():
+            idxs = (~mask_safe).nonzero(as_tuple=True)[0]
+            b_raw_unsafe = b_raw[idxs]
+            b_xy = b_raw_unsafe[:, :2]
+            b_xy_norm = torch.norm(b_xy, dim=1, keepdim=True)
+            scale = torch.sin(torch.tensor(self.theta_max, device=device)) / (b_xy_norm + 1e-6)
+            
+            bs_3_cmd[idxs, :2] = b_xy * scale
+            bs_3_cmd[idxs, 2] = torch.cos(torch.tensor(self.theta_max, device=device))
+            
+        # 将目标 Z 轴向量投影到机体系: v_B = R^T * b3_cmd
+        v_B = torch.bmm(R.transpose(1, 2), bs_3_cmd.unsqueeze(-1)).squeeze(-1)
+        
+        # 计算约化误差四元数 q_e (从当前机体 Z 轴 e3 到目标 v_B 的最短旋转)
+        cross_prod = torch.cross(e3, v_B, dim=1) 
+        sin_phi = torch.norm(cross_prod, dim=1, keepdim=True)
+        cos_phi = torch.sum(e3 * v_B, dim=1, keepdim=True)
+        
+        # phi = arccos(e3 . v_B)
+        phi = torch.acos(torch.clamp(cos_phi, -1.0, 1.0))
+        u = cross_prod / (sin_phi + 1e-6)
+        
+        q_vec = torch.sin(phi/2) * u
+        q_w = torch.cos(phi/2)
+        
+        # 计算期望机体系角速率 w = (2/tau) * sgn(qw) * q_vec (单位: rad/s)
+        sgn_qw = torch.sign(q_w)
+        sgn_qw[sgn_qw == 0] = 1.0 # 处理 sign 为 0 的情况
+        
+        omega_ideal = (2.0 / self.tau) * sgn_qw * q_vec
+        
+        # === 5. 生成最终控制指令 ===
+        
+        # -- 推力指令 (Thrust) --
+        # b3_cur 是机体 Z 轴在世界系下的朝向 (旋转矩阵 R 的第三列)
+        b3_cur = R[:, :, 2]
+        
+        # f_scalar = max(0, f_W . b3_cur)，如果翻过来了推力置 0
+        f_scalar = torch.relu(torch.sum(f_W * b3_cur, dim=1, keepdim=True))
+        
+        # T_cmd = f_scalar / F_MAX，并限幅在 0.75 内
+        T_cmd = f_scalar / self.F_MAX
+        T_cmd = torch.clamp(T_cmd, max=self.max_thrust_cmd)
+        
+        # 归一化: SimpleFlight 的 Action 空间 [-1, 1] 对应 0~1 的推力百分比
+        # 映射公式: action = 2 * T_cmd - 1
+        action_thrust = 2.0 * T_cmd - 1.0
+
+        # -- 角速率指令 (Rates) --
+        # 将弧度制 rad/s 转为角度制 deg/s
+        omega_deg = omega_ideal * (180.0 / np.pi)
+        
+        # 实施限制 (50 deg/s)
+        omega_deg = torch.clamp(omega_deg, -self.max_rate_deg, self.max_rate_deg)
+        
+        # 映射到输出格式
+        # 与地面站PID不同，地面站PID约定: [deg(wx), -deg(wy), psi_ref]
+        cmd_rate_x = omega_deg[:, 0:1]
+        cmd_rate_y = omega_deg[:, 1:2] #(此处和下面的偏航角设置是唯一与地面站PID不一致的地方)
+        
+        # 偏航 (Yaw): 因为 simpleflight 默认是角速率控制，此处设为 0 来锁定当前航向，实现最简稳健控制
+        cmd_rate_z = torch.zeros_like(cmd_rate_x)
+        
+        # 归一化角速率: transforms.py 中的 scale 为 180.0
+        action_rate_x = cmd_rate_x / self.norm_rate_scale
+        action_rate_y = cmd_rate_y / self.norm_rate_scale
+        action_rate_z = cmd_rate_z / self.norm_rate_scale
+        
+        # 拼接动作: [Rate_X, Rate_Y, Rate_Z, Thrust]
+        base_action = torch.cat([action_rate_x, action_rate_y, action_rate_z, action_thrust], dim=-1)
+        
+        # 最终截断确保处于 [-1, 1] 范围内
+        base_action = torch.clamp(base_action, -1.0, 1.0)
+
+        # 恢复原始维度 (Batch, Agents, 4)
+        if len(original_shape) > 1:
+            base_action = base_action.view(*original_shape, 4)
+            
+        return base_action
 
 
 class SACPolicy(object):
@@ -108,6 +271,8 @@ class SACPolicy(object):
         self.base_policy = PIDCTBR(action_dim=self.action_dim).to(self.device)
         # 硬编码 bc loss 系数（不要 YAML）。需要启用时改成 >0。
         self.bc_coef = 0.0
+
+        self.use_base_policy = getattr(cfg, "use_base_policy", False) # 默认不开启，由配置文件sac.yaml决定
 
         self.target_entropy = - torch.tensor(self.action_dim, device=self.device)
         init_entropy = 1.0
@@ -169,13 +334,22 @@ class SACPolicy(object):
         # return tensordict.update({self.act_name: self.agent_spec.action_spec.zero()})
         actor_input = tensordict.select(*self.policy_in_keys)
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
-        actor_output = self.actor(actor_input)
+        #actor_output = self.actor(actor_input)
         # actor_output["action"].batch_size = tensordict.batch_size
-        tensordict.update(actor_output)
+        #tensordict.update(actor_output)
 
         # 额外写入 base_action（不影响 env step），供 bc loss 使用
         with torch.no_grad():
             base_action = self.base_policy(actor_input[self.obs_name])
+        if self.use_base_policy:
+            # === 核心逻辑：将 PID 动作写入环境执行的主键位 ===
+            tensordict.set(self.act_name, base_action)
+            # 为防止下游链路检查 logp，设置一个全零的占位符
+            tensordict.set(f"{self.agent_spec.name}.logp", torch.zeros_like(base_action[..., :1]))
+        else:
+            # 正常流程：使用训练中的神经网络 Actor
+            actor_output = self.actor(actor_input)
+            tensordict.update(actor_output)
         tensordict.set(("info", "base_action"), base_action)
         return tensordict
 
