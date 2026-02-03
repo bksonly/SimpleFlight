@@ -265,12 +265,9 @@ class SACPolicy(object):
         
         self.action_dim = self.agent_spec.action_spec.shape[-1]
 
-        # ===== Base policy wiring (for BC loss) =====
-        # base_policy 的输出会写入 ("info","base_action")，用于在 train_op 里做 bc_loss。
-        # 注意：环境仍然执行 RL actor 写入的 ("agents","action")（除非你后续改策略）。
         self.base_policy = PIDCTBR(action_dim=self.action_dim).to(self.device)
         # 硬编码 bc loss 系数（不要 YAML）。需要启用时改成 >0。
-        self.bc_coef = 0.0
+        self.bc_coef = 1.0
 
         self.use_base_policy = getattr(cfg, "use_base_policy", False) # 默认不开启，由配置文件sac.yaml决定
 
@@ -331,26 +328,22 @@ class SACPolicy(object):
         self.critic_loss_fn = {"mse": F.mse_loss, "smooth_l1": F.smooth_l1_loss}[self.cfg.critic_loss]
 
     def __call__(self, tensordict: TensorDict, deterministic: bool=False) -> TensorDict:
-        # return tensordict.update({self.act_name: self.agent_spec.action_spec.zero()})
         actor_input = tensordict.select(*self.policy_in_keys)
         actor_input.batch_size = [*actor_input.batch_size, self.agent_spec.n]
-        #actor_output = self.actor(actor_input)
-        # actor_output["action"].batch_size = tensordict.batch_size
-        #tensordict.update(actor_output)
 
-        # 额外写入 base_action（不影响 env step），供 bc loss 使用
+        # 1) Always compute RL actor action (default env execution path)
+        actor_output = self.actor(actor_input)
+        tensordict.update(actor_output)
+
+        # 2) Always compute base (model-based) action for BC supervision / debugging
         with torch.no_grad():
             base_action = self.base_policy(actor_input[self.obs_name])
-        if self.use_base_policy:
-            # === 核心逻辑：将 PID 动作写入环境执行的主键位 ===
-            tensordict.set(self.act_name, base_action)
-            # 为防止下游链路检查 logp，设置一个全零的占位符
-            tensordict.set(f"{self.agent_spec.name}.logp", torch.zeros_like(base_action[..., :1]))
-        else:
-            # 正常流程：使用训练中的神经网络 Actor
-            actor_output = self.actor(actor_input)
-            tensordict.update(actor_output)
         tensordict.set(("info", "base_action"), base_action)
+
+        # 3) Debug switch: optionally override env-executed action with base_action
+        if self.use_base_policy:
+            tensordict.set(self.act_name, base_action)
+
         return tensordict
 
     def train_op(self, data: TensorDict, verbose: bool=False):
@@ -408,14 +401,22 @@ class SACPolicy(object):
 
                     qs = self.critic(state, act)
                     q = torch.min(qs, dim=-1).values
-                    actor_loss = (self.log_alpha.exp() * logp - q).mean()
-
-                    # ===== BC loss scaffold =====
-                    # 从 rollout 时写入的 ("info","base_action") 取出基座动作，计算 bc_loss
                     bc_loss = None
                     if ("info", "base_action") in transition.keys(True, True):
                         base_action = transition[("info", "base_action")]
-                        bc_loss = F.mse_loss(act, base_action) #示意，不一定是这样
+                        bc_loss = F.mse_loss(act, base_action)
+
+                    # RL actor objective (SAC): maximize Q and entropy
+                    rl_actor_loss = (self.log_alpha.exp() * logp - q).mean()
+
+                    # Blend RL loss with BC loss.
+                    # - bc_coef = 0.0 -> pure RL
+                    # - bc_coef = 1.0 -> pure BC
+                    if bc_loss is None:
+                        actor_loss = rl_actor_loss
+                    else:
+                        bc_coef = float(self.bc_coef)
+                        actor_loss = (1.0 - bc_coef) * rl_actor_loss + bc_coef * bc_loss
 
                     self.actor_opt.zero_grad()
                     actor_loss.backward()
@@ -429,6 +430,7 @@ class SACPolicy(object):
 
                     infos_actor.append(TensorDict({
                         "actor_loss": actor_loss,
+                        "rl_actor_loss": rl_actor_loss,
                         "actor_grad_norm": actor_grad_norm,
                         "entropy": -logp.mean(),
                         "alpha": self.log_alpha.exp().detach(),
