@@ -285,7 +285,8 @@ class SACPolicy(object):
     def make_actor(self):
 
         self.policy_in_keys = [self.obs_name]
-        self.policy_out_keys = [self.act_name, f"{self.agent_spec.name}.logp"]
+        self.rl_action_mean_key = ("info", "rl_action_mean")
+        self.policy_out_keys = [self.act_name, f"{self.agent_spec.name}.logp", self.rl_action_mean_key]
         
         if self.cfg.share_actor:
             self.actor = TensorDictModule(
@@ -398,25 +399,50 @@ class SACPolicy(object):
                     actor_output = self.actor(transition, deterministic=False)
                     act = actor_output[self.act_name]
                     logp = actor_output[f"{self.agent_spec.name}.logp"]
+                    act_mean = actor_output[self.rl_action_mean_key]
 
                     qs = self.critic(state, act)
                     q = torch.min(qs, dim=-1).values
-                    bc_loss = None
-                    if ("info", "base_action") in transition.keys(True, True):
-                        base_action = transition[("info", "base_action")]
-                        bc_loss = F.mse_loss(act, base_action)
+                    awr_loss = None
 
-                    # RL actor objective (SAC): maximize Q and entropy
+                    base_action = transition[("info", "base_action")]
+                    # ===== AWR (Advantage-Weighted Regression) loss =====
+                    # Q(s, a_base)
+                    q_base_all = self.critic(state, base_action)
+                    q_base = torch.min(q_base_all, dim=-1).values
+
+                    # V(s) ≈ Q(s, a_pi) - alpha * logπ(a_pi|s)
+                    # 用rl的当前动作计算v，其实可以多次采样a，但是性能开销会拉大很多，后续如果训练不稳定再用这招
+                    alpha = self.log_alpha.exp().detach()
+                    v = q - alpha * logp.squeeze(-1)
+
+                    # A(s, a_base)
+                    adv = (q_base - v).detach()
+
+                    # weights: exp(adv / beta) with clipping
+                    beta = getattr(self, "awr_beta", 0.1)
+                    adv_clip = getattr(self, "awr_adv_clip", 10.0)
+                    w_clip = getattr(self, "awr_w_clip", 20.0)
+                    w = torch.exp(torch.clamp(adv / beta, max=adv_clip)).clamp(max=w_clip)
+
+                    # log π(a_base|s)
+                    obs = transition[self.obs_name]
+                    actor_net = getattr(self.actor, "module", None) or getattr(self.actor, "_module", None)
+                    if actor_net is None or not hasattr(actor_net, "log_prob"):
+                        raise RuntimeError("Actor network must expose `log_prob(obs, action)` for AWR.")
+                    logp_base = actor_net.log_prob(obs, base_action).squeeze(-1)
+
+                    # weighted NLL
+                    awr_loss = -(w * logp_base).mean()
+
+                    #=====BC loss=====
+                    bc_loss = F.mse_loss(base_action, act_mean)
+
                     rl_actor_loss = (self.log_alpha.exp() * logp - q).mean()
 
-                    # Blend RL loss with BC loss.
-                    # - bc_coef = 0.0 -> pure RL
-                    # - bc_coef = 1.0 -> pure BC
-                    if bc_loss is None:
-                        actor_loss = rl_actor_loss
-                    else:
-                        bc_coef = float(self.bc_coef)
-                        actor_loss = (1.0 - bc_coef) * rl_actor_loss + bc_coef * bc_loss
+                    bc_coef = float(self.bc_coef)
+                    actor_loss = (1.0 - bc_coef) * rl_actor_loss + bc_coef * awr_loss
+                    # actor_loss = (1.0 - bc_coef) * rl_actor_loss + bc_coef * bc_loss
 
                     self.actor_opt.zero_grad()
                     actor_loss.backward()
@@ -435,7 +461,7 @@ class SACPolicy(object):
                         "entropy": -logp.mean(),
                         "alpha": self.log_alpha.exp().detach(),
                         "alpha_loss": alpha_loss,
-                        **({"bc_loss": bc_loss.detach()} if bc_loss is not None else {}),
+                        **({"awr_loss": awr_loss.detach()} if awr_loss is not None else {}),
                     }, []))
 
 
@@ -483,8 +509,13 @@ class Actor(nn.Module):
         else:
             act = act_dist.rsample()
         log_prob = act_dist.log_prob(act).unsqueeze(-1)
+        return act, log_prob, act_dist.mode
 
-        return act, log_prob
+    def log_prob(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Return log π(action|obs) under the current policy distribution."""
+        x = self.encoder(obs)
+        act_dist = self.act(x)
+        return act_dist.log_prob(action).unsqueeze(-1)
 
 
 class Critic(nn.Module):
